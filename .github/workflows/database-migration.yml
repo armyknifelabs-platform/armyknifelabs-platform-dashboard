@@ -1,0 +1,100 @@
+name: Database Migration
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Migration action'
+        required: true
+        type: choice
+        options:
+          - run
+          - revert
+          - show
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - production
+          - staging
+          - test
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  migrate:
+    name: Run Database Migration
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get database credentials from Secrets Manager
+        id: db-creds
+        run: |
+          if [ "${{ github.event.inputs.environment }}" == "production" ]; then
+            DB_PASSWORD=$(aws secretsmanager get-secret-value --secret-id seip/production/database/password --query SecretString --output text --region ${{ env.AWS_REGION }})
+            DB_HOST="seip-prod-db.cmn4wqs645sa.us-east-1.rds.amazonaws.com"
+          elif [ "${{ github.event.inputs.environment }}" == "test" ]; then
+            DB_PASSWORD=$(aws secretsmanager get-secret-value --secret-id default-tenant/credentials/database --query SecretString --output text --region ${{ env.AWS_REGION }} | jq -r '.password')
+            DB_HOST="ai-orchestration-db.cmn4wqs645sa.us-east-1.rds.amazonaws.com"
+          fi
+
+          echo "::add-mask::$DB_PASSWORD"
+          echo "DB_PASSWORD=$DB_PASSWORD" >> $GITHUB_ENV
+          echo "DB_HOST=$DB_HOST" >> $GITHUB_ENV
+
+      - name: Run migration
+        if: github.event.inputs.action == 'run'
+        run: |
+          cd packages/backend
+          export DATABASE_URL="postgresql://postgres:${{ env.DB_PASSWORD }}@${{ env.DB_HOST }}:5432/ai_orchestration?sslmode=no-verify"
+          pnpm run migration:run
+
+      - name: Revert migration
+        if: github.event.inputs.action == 'revert'
+        run: |
+          cd packages/backend
+          export DATABASE_URL="postgresql://postgres:${{ env.DB_PASSWORD }}@${{ env.DB_HOST }}:5432/ai_orchestration?sslmode=no-verify"
+          pnpm run migration:revert
+
+      - name: Show migrations
+        if: github.event.inputs.action == 'show'
+        run: |
+          cd packages/backend
+          export DATABASE_URL="postgresql://postgres:${{ env.DB_PASSWORD }}@${{ env.DB_HOST }}:5432/ai_orchestration?sslmode=no-verify"
+          pnpm run migration:show || npx typeorm migration:show -d src/db/data-source.ts
+
+      - name: Migration summary
+        run: |
+          echo "═══════════════════════════════════════════════════════════════"
+          echo "                MIGRATION SUMMARY"
+          echo "═══════════════════════════════════════════════════════════════"
+          echo "Action: ${{ github.event.inputs.action }}"
+          echo "Environment: ${{ github.event.inputs.environment }}"
+          echo "Database: ${{ env.DB_HOST }}"
+          echo "═══════════════════════════════════════════════════════════════"

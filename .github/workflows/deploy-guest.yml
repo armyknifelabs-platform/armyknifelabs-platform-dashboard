@@ -1,0 +1,447 @@
+name: Deploy to Guest Environment (guest.armyknifelabs.com)
+
+# Guest/staging deployment workflow
+# Deploys to guest environment with authentication bypassed
+# Triggers: Manual workflow_dispatch or pushes to 'guest' branch
+
+on:
+  push:
+    branches:
+      - guest  # Auto-deploy when pushing to guest branch
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to deploy (leave empty for current branch)'
+        required: false
+        type: string
+        default: ''
+      service:
+        description: 'Service to deploy'
+        required: true
+        type: choice
+        options:
+          - backend
+          - frontend
+          - both
+        default: both
+
+env:
+  NODE_VERSION: '22'
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: 241533127046.dkr.ecr.us-east-1.amazonaws.com
+  ECS_CLUSTER: seip-prod
+  BACKEND_SERVICE: seip-backend-guest
+  FRONTEND_SERVICE: seip-frontend-guest
+  # Guest environment uses same cluster but different services
+
+jobs:
+  # Extract version/timestamp for guest deployment
+  setup:
+    name: Setup Guest Deployment
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      deploy_backend: ${{ steps.services.outputs.deploy_backend }}
+      deploy_frontend: ${{ steps.services.outputs.deploy_frontend }}
+
+    steps:
+      - name: Generate guest version
+        id: version
+        run: |
+          # Use timestamp for guest deployments
+          VERSION=guest-$(date +%Y%m%d-%H%M%S)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Deploying guest version: $VERSION"
+
+      - name: Determine services to deploy
+        id: services
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            SERVICE="${{ github.event.inputs.service }}"
+          else
+            SERVICE="both"
+          fi
+
+          if [ "$SERVICE" == "backend" ] || [ "$SERVICE" == "both" ]; then
+            echo "deploy_backend=true" >> $GITHUB_OUTPUT
+          else
+            echo "deploy_backend=false" >> $GITHUB_OUTPUT
+          fi
+
+          if [ "$SERVICE" == "frontend" ] || [ "$SERVICE" == "both" ]; then
+            echo "deploy_frontend=true" >> $GITHUB_OUTPUT
+          else
+            echo "deploy_frontend=false" >> $GITHUB_OUTPUT
+          fi
+
+  # Build and push backend to guest
+  deploy-backend-guest:
+    name: Deploy Backend (Guest)
+    runs-on: ubuntu-latest
+    needs: setup
+    if: needs.setup.outputs.deploy_backend == 'true'
+
+    steps:
+      - name: Checkout VERSION.json from guest branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
+          sparse-checkout: |
+            VERSION.json
+          sparse-checkout-cone-mode: false
+
+      - name: Extract backend commit from VERSION.json
+        id: version
+        run: |
+          if [ -f VERSION.json ]; then
+            BACKEND_COMMIT=$(jq -r '.components.backend.commit' VERSION.json)
+            RELEASE_VERSION=$(jq -r '.release' VERSION.json)
+            echo "backend_commit=$BACKEND_COMMIT" >> $GITHUB_OUTPUT
+            echo "release_version=$RELEASE_VERSION" >> $GITHUB_OUTPUT
+            echo "Using backend commit: $BACKEND_COMMIT from release $RELEASE_VERSION"
+          else
+            echo "VERSION.json not found, using current branch"
+            echo "backend_commit=${{ github.sha }}" >> $GITHUB_OUTPUT
+            echo "release_version=dev" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout backend code from pinned commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.version.outputs.backend_commit }}
+          sparse-checkout: |
+            packages/backend
+            Dockerfile.backend
+            package.json
+            pnpm-workspace.yaml
+            pnpm-lock.yaml
+          sparse-checkout-cone-mode: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Check if backend image exists in ECR
+        id: check-backend-image
+        run: |
+          BACKEND_COMMIT="${{ steps.version.outputs.backend_commit }}"
+          IMAGE_TAG="commit-${BACKEND_COMMIT}"
+
+          echo "Checking for image: ${{ env.ECR_REGISTRY }}/seip-backend:${IMAGE_TAG}"
+
+          if aws ecr describe-images \
+            --repository-name seip-backend \
+            --image-ids imageTag=${IMAGE_TAG} \
+            --region ${{ env.AWS_REGION }} > /dev/null 2>&1; then
+            echo "✅ Image found in ECR for commit ${BACKEND_COMMIT}"
+            echo "image_exists=true" >> $GITHUB_OUTPUT
+            echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Image not found, will build new image"
+            echo "image_exists=false" >> $GITHUB_OUTPUT
+            echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.check-backend-image.outputs.image_exists == 'false'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push backend image (guest)
+        if: steps.check-backend-image.outputs.image_exists == 'false'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.backend
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.ECR_REGISTRY }}/seip-backend:${{ steps.check-backend-image.outputs.image_tag }}
+            ${{ env.ECR_REGISTRY }}/seip-backend:${{ needs.setup.outputs.version }}
+            ${{ env.ECR_REGISTRY }}/seip-backend:guest-latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            APP_VERSION=${{ needs.setup.outputs.version }}
+
+      - name: Tag existing image with new version
+        if: steps.check-backend-image.outputs.image_exists == 'true'
+        run: |
+          MANIFEST=$(aws ecr batch-get-image \
+            --repository-name seip-backend \
+            --image-ids imageTag=${{ steps.check-backend-image.outputs.image_tag }} \
+            --region ${{ env.AWS_REGION }} \
+            --output json \
+            --query 'images[0].imageManifest' \
+            --output text)
+
+          # Tag with new version
+          aws ecr put-image \
+            --repository-name seip-backend \
+            --image-tag ${{ needs.setup.outputs.version }} \
+            --image-manifest "$MANIFEST" \
+            --region ${{ env.AWS_REGION }}
+
+          # Tag as guest-latest
+          aws ecr put-image \
+            --repository-name seip-backend \
+            --image-tag guest-latest \
+            --image-manifest "$MANIFEST" \
+            --region ${{ env.AWS_REGION }}
+
+          echo "✅ Tagged existing image with ${{ needs.setup.outputs.version }} and guest-latest"
+
+      - name: Update backend guest task definition
+        id: update-task-def
+        run: |
+          # Use the version tag for the image
+          IMAGE_TAG="${{ needs.setup.outputs.version }}"
+
+          aws ecs describe-task-definition \
+            --task-definition seip-backend-guest \
+            --region ${{ env.AWS_REGION }} \
+            --query 'taskDefinition' > /tmp/task-def.json
+
+          jq --arg IMAGE "${{ env.ECR_REGISTRY }}/seip-backend:${IMAGE_TAG}" \
+             --arg VERSION "${{ needs.setup.outputs.version }}" \
+             --arg COMMIT "${{ steps.version.outputs.backend_commit }}" \
+             'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy) |
+              .containerDefinitions[0].image = $IMAGE |
+              .containerDefinitions[0].environment += [
+                {"name": "APP_VERSION", "value": $VERSION},
+                {"name": "BACKEND_COMMIT", "value": $COMMIT}
+              ] |
+              .containerDefinitions[0].environment |= unique_by(.name)' \
+             /tmp/task-def.json > /tmp/new-task-def.json
+
+          NEW_REVISION=$(aws ecs register-task-definition \
+            --cli-input-json file:///tmp/new-task-def.json \
+            --region ${{ env.AWS_REGION }} \
+            --query 'taskDefinition.revision' \
+            --output text)
+
+          echo "✅ Registered task definition: seip-backend-guest:${NEW_REVISION}"
+          echo "✅ Using image: ${{ env.ECR_REGISTRY }}/seip-backend:${IMAGE_TAG}"
+          echo "✅ Backend commit: ${{ steps.version.outputs.backend_commit }}"
+          echo "task_revision=${NEW_REVISION}" >> $GITHUB_OUTPUT
+
+      - name: Deploy to ECS guest service
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.BACKEND_SERVICE }} \
+            --task-definition seip-backend-guest:${{ steps.update-task-def.outputs.task_revision }} \
+            --force-new-deployment \
+            --region ${{ env.AWS_REGION }}
+
+  # Build and push frontend to guest
+  deploy-frontend-guest:
+    name: Deploy Frontend (Guest)
+    runs-on: ubuntu-latest
+    needs: setup
+    if: needs.setup.outputs.deploy_frontend == 'true'
+
+    steps:
+      - name: Checkout VERSION.json from guest branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
+          sparse-checkout: |
+            VERSION.json
+          sparse-checkout-cone-mode: false
+
+      - name: Extract frontend commit from VERSION.json
+        id: version
+        run: |
+          if [ -f VERSION.json ]; then
+            FRONTEND_COMMIT=$(jq -r '.components.frontend.commit' VERSION.json)
+            RELEASE_VERSION=$(jq -r '.release' VERSION.json)
+            echo "frontend_commit=$FRONTEND_COMMIT" >> $GITHUB_OUTPUT
+            echo "release_version=$RELEASE_VERSION" >> $GITHUB_OUTPUT
+            echo "Using frontend commit: $FRONTEND_COMMIT from release $RELEASE_VERSION"
+          else
+            echo "VERSION.json not found, using current branch"
+            echo "frontend_commit=${{ github.sha }}" >> $GITHUB_OUTPUT
+            echo "release_version=dev" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout frontend code from pinned commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.version.outputs.frontend_commit }}
+          sparse-checkout: |
+            packages/frontend
+            Dockerfile.frontend
+            nginx.production.conf
+            package.json
+            pnpm-workspace.yaml
+            pnpm-lock.yaml
+            docker
+          sparse-checkout-cone-mode: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Check if frontend image exists in ECR
+        id: check-frontend-image
+        run: |
+          FRONTEND_COMMIT="${{ steps.version.outputs.frontend_commit }}"
+          IMAGE_TAG="commit-${FRONTEND_COMMIT}"
+
+          echo "Checking for image: ${{ env.ECR_REGISTRY }}/seip-frontend:${IMAGE_TAG}"
+
+          if aws ecr describe-images \
+            --repository-name seip-frontend \
+            --image-ids imageTag=${IMAGE_TAG} \
+            --region ${{ env.AWS_REGION }} > /dev/null 2>&1; then
+            echo "✅ Image found in ECR for commit ${FRONTEND_COMMIT}"
+            echo "image_exists=true" >> $GITHUB_OUTPUT
+            echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Image not found, will build new image"
+            echo "image_exists=false" >> $GITHUB_OUTPUT
+            echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.check-frontend-image.outputs.image_exists == 'false'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push frontend image (guest - auth bypassed)
+        if: steps.check-frontend-image.outputs.image_exists == 'false'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.frontend
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.ECR_REGISTRY }}/seip-frontend:${{ steps.check-frontend-image.outputs.image_tag }}
+            ${{ env.ECR_REGISTRY }}/seip-frontend:${{ needs.setup.outputs.version }}
+            ${{ env.ECR_REGISTRY }}/seip-frontend:guest-latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            APP_VERSION=${{ needs.setup.outputs.version }}
+            NGINX_CONFIG=nginx.production.conf
+            VITE_API_URL=https://guest.armyknifelabs.com/api/v1
+            VITE_ENVIRONMENT=guest
+
+      - name: Tag existing frontend image with new version
+        if: steps.check-frontend-image.outputs.image_exists == 'true'
+        run: |
+          MANIFEST=$(aws ecr batch-get-image \
+            --repository-name seip-frontend \
+            --image-ids imageTag=${{ steps.check-frontend-image.outputs.image_tag }} \
+            --region ${{ env.AWS_REGION }} \
+            --output json \
+            --query 'images[0].imageManifest' \
+            --output text)
+
+          # Tag with new version
+          aws ecr put-image \
+            --repository-name seip-frontend \
+            --image-tag ${{ needs.setup.outputs.version }} \
+            --image-manifest "$MANIFEST" \
+            --region ${{ env.AWS_REGION }}
+
+          # Tag as guest-latest
+          aws ecr put-image \
+            --repository-name seip-frontend \
+            --image-tag guest-latest \
+            --image-manifest "$MANIFEST" \
+            --region ${{ env.AWS_REGION }}
+
+          echo "✅ Tagged existing image with ${{ needs.setup.outputs.version }} and guest-latest"
+
+      - name: Update frontend guest task definition
+        id: update-task-def-frontend
+        run: |
+          # Use the version tag for the image
+          IMAGE_TAG="${{ needs.setup.outputs.version }}"
+
+          aws ecs describe-task-definition \
+            --task-definition seip-frontend-guest \
+            --region ${{ env.AWS_REGION }} \
+            --query 'taskDefinition' > /tmp/frontend-task-def.json
+
+          jq --arg IMAGE "${{ env.ECR_REGISTRY }}/seip-frontend:${IMAGE_TAG}" \
+             --arg VERSION "${{ needs.setup.outputs.version }}" \
+             --arg COMMIT "${{ steps.version.outputs.frontend_commit }}" \
+             'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy) |
+              .containerDefinitions[0].image = $IMAGE |
+              .containerDefinitions[0].environment += [
+                {"name": "VITE_ENVIRONMENT", "value": "guest"},
+                {"name": "APP_VERSION", "value": $VERSION},
+                {"name": "FRONTEND_COMMIT", "value": $COMMIT}
+              ] |
+              .containerDefinitions[0].environment |= unique_by(.name)' \
+             /tmp/frontend-task-def.json > /tmp/new-frontend-task-def.json
+
+          NEW_REVISION=$(aws ecs register-task-definition \
+            --cli-input-json file:///tmp/new-frontend-task-def.json \
+            --region ${{ env.AWS_REGION }} \
+            --query 'taskDefinition.revision' \
+            --output text)
+
+          echo "✅ Registered task definition: seip-frontend-guest:${NEW_REVISION}"
+          echo "✅ Using image: ${{ env.ECR_REGISTRY }}/seip-frontend:${IMAGE_TAG}"
+          echo "✅ Frontend commit: ${{ steps.version.outputs.frontend_commit }}"
+          echo "task_revision=${NEW_REVISION}" >> $GITHUB_OUTPUT
+
+      - name: Deploy to ECS guest service
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.FRONTEND_SERVICE }} \
+            --task-definition seip-frontend-guest:${{ steps.update-task-def-frontend.outputs.task_revision }} \
+            --force-new-deployment \
+            --region ${{ env.AWS_REGION }}
+
+  # Deployment summary
+  deployment-success:
+    name: Guest Deployment Complete
+    runs-on: ubuntu-latest
+    needs: [setup, deploy-backend-guest, deploy-frontend-guest]
+    if: always()
+
+    steps:
+      - name: Deployment summary
+        run: |
+          echo "═══════════════════════════════════════════════════════════════"
+          echo "              GUEST ENVIRONMENT DEPLOYMENT"
+          echo "═══════════════════════════════════════════════════════════════"
+          echo "Version: ${{ needs.setup.outputs.version }}"
+          echo "Environment: GUEST (Authentication Bypassed)"
+          echo "Backend deployed: ${{ needs.setup.outputs.deploy_backend }}"
+          echo "Frontend deployed: ${{ needs.setup.outputs.deploy_frontend }}"
+          echo ""
+          echo "🌐 Guest URL: https://guest.armyknifelabs.com"
+          echo "🔓 No authentication required"
+          echo "📊 Perfect for demos and testing"
+          echo "═══════════════════════════════════════════════════════════════"
+
+      - name: Check deployment results
+        run: |
+          BACKEND_STATUS="${{ needs.deploy-backend-guest.result }}"
+          FRONTEND_STATUS="${{ needs.deploy-frontend-guest.result }}"
+
+          if [ "$BACKEND_STATUS" == "failure" ] || [ "$FRONTEND_STATUS" == "failure" ]; then
+            echo "❌ Guest deployment failed - check logs above"
+            exit 1
+          else
+            echo "✅ Guest deployment completed successfully!"
+            echo "Visit: https://guest.armyknifelabs.com"
+          fi

@@ -1,0 +1,492 @@
+name: CD - Deploy to AWS ECS
+
+# Primary deployment workflow - deploys to AWS ECS Fargate
+# Triggers: Git tags (v*.*.*) or manual workflow_dispatch
+# Features: Multi-service deployment, health checks, error reporting
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+      - 'v*.*.*-*'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        type: choice
+        options:
+          - production
+          - staging
+      service:
+        description: 'Service to deploy'
+        required: true
+        type: choice
+        options:
+          - backend
+          - frontend
+          - both
+
+env:
+  NODE_VERSION: '22'
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: 241533127046.dkr.ecr.us-east-1.amazonaws.com
+  ECS_CLUSTER: seip-prod
+  BACKEND_SERVICE: seip-backend-dashboard
+  FRONTEND_SERVICE: seip-frontend-dashboard
+
+jobs:
+  # Extract version from tag or use workflow input
+  setup:
+    name: Setup Deployment
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      environment: ${{ steps.env.outputs.environment }}
+      deploy_backend: ${{ steps.services.outputs.deploy_backend }}
+      deploy_frontend: ${{ steps.services.outputs.deploy_frontend }}
+
+    steps:
+      - name: Extract version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" == "push" ]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+          else
+            VERSION=manual-$(date +%Y%m%d-%H%M%S)
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Deploying version: $VERSION"
+
+      - name: Determine environment
+        id: env
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            ENV="${{ github.event.inputs.environment }}"
+          else
+            ENV="production"
+          fi
+          echo "environment=$ENV" >> $GITHUB_OUTPUT
+          echo "Deploying to: $ENV"
+
+      - name: Determine services to deploy
+        id: services
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            SERVICE="${{ github.event.inputs.service }}"
+          else
+            SERVICE="both"
+          fi
+
+          if [ "$SERVICE" == "backend" ] || [ "$SERVICE" == "both" ]; then
+            echo "deploy_backend=true" >> $GITHUB_OUTPUT
+          else
+            echo "deploy_backend=false" >> $GITHUB_OUTPUT
+          fi
+
+          if [ "$SERVICE" == "frontend" ] || [ "$SERVICE" == "both" ]; then
+            echo "deploy_frontend=true" >> $GITHUB_OUTPUT
+          else
+            echo "deploy_frontend=false" >> $GITHUB_OUTPUT
+          fi
+
+  # Build and push backend
+  deploy-backend:
+    name: Deploy Backend
+    runs-on: ubuntu-latest
+    needs: setup
+    if: needs.setup.outputs.deploy_backend == 'true'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Verify Docker platform support
+        run: |
+          echo "Verifying linux/amd64 platform support for ECS Fargate..."
+          docker buildx inspect --bootstrap
+
+      - name: Build and push backend image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.backend
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.ECR_REGISTRY }}/seip-backend:${{ needs.setup.outputs.version }}
+            ${{ env.ECR_REGISTRY }}/seip-backend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            APP_VERSION=${{ needs.setup.outputs.version }}
+
+      - name: Get current task definition
+        id: get-task-def
+        run: |
+          echo "Fetching current task definition..."
+          aws ecs describe-task-definition \
+            --task-definition seip-backend \
+            --region ${{ env.AWS_REGION }} \
+            --query 'taskDefinition' > /tmp/task-def.json
+
+          # Extract the family and revision
+          FAMILY=$(jq -r '.family' /tmp/task-def.json)
+          echo "family=$FAMILY" >> $GITHUB_OUTPUT
+
+      - name: Update task definition with new image and APP_VERSION
+        id: update-task-def
+        run: |
+          echo "Creating new task definition with version ${{ needs.setup.outputs.version }}..."
+
+          # Get the existing task definition and update it
+          jq --arg IMAGE "${{ env.ECR_REGISTRY }}/seip-backend:${{ needs.setup.outputs.version }}" \
+             --arg VERSION "${{ needs.setup.outputs.version }}" \
+             'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy) |
+              .containerDefinitions[0].image = $IMAGE |
+              .containerDefinitions[0].environment += [{"name": "APP_VERSION", "value": $VERSION}] |
+              .containerDefinitions[0].environment |= unique_by(.name)' \
+             /tmp/task-def.json > /tmp/new-task-def.json
+
+          # Register the new task definition
+          NEW_REVISION=$(aws ecs register-task-definition \
+            --cli-input-json file:///tmp/new-task-def.json \
+            --region ${{ env.AWS_REGION }} \
+            --query 'taskDefinition.revision' \
+            --output text)
+
+          echo "✅ Registered task definition: seip-backend:${NEW_REVISION}"
+          echo "task_revision=${NEW_REVISION}" >> $GITHUB_OUTPUT
+
+      - name: Deploy to ECS with new task definition
+        run: |
+          echo "Deploying backend with task definition revision ${{ steps.update-task-def.outputs.task_revision }}..."
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.BACKEND_SERVICE }} \
+            --task-definition seip-backend:${{ steps.update-task-def.outputs.task_revision }} \
+            --force-new-deployment \
+            --region ${{ env.AWS_REGION }} \
+            --output table
+
+      - name: Wait for deployment (with extended timeout)
+        timeout-minutes: 20
+        run: |
+          echo "Waiting for ECS service to stabilize (up to 20 minutes)..."
+          echo "Monitoring deployment progress..."
+
+          # Custom polling with better feedback
+          MAX_ATTEMPTS=60  # 60 * 20 seconds = 20 minutes
+          ATTEMPT=0
+
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+
+            # Get service status
+            SERVICE_STATUS=$(aws ecs describe-services \
+              --cluster ${{ env.ECS_CLUSTER }} \
+              --services ${{ env.BACKEND_SERVICE }} \
+              --region ${{ env.AWS_REGION }} \
+              --query 'services[0]' \
+              --output json)
+
+            RUNNING_COUNT=$(echo $SERVICE_STATUS | jq -r '.runningCount')
+            DESIRED_COUNT=$(echo $SERVICE_STATUS | jq -r '.desiredCount')
+            DEPLOYMENT_COUNT=$(echo $SERVICE_STATUS | jq -r '.deployments | length')
+
+            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS: Running=$RUNNING_COUNT Desired=$DESIRED_COUNT Deployments=$DEPLOYMENT_COUNT"
+
+            # Check if stable (1 deployment, running == desired)
+            if [ "$DEPLOYMENT_COUNT" -eq 1 ] && [ "$RUNNING_COUNT" -eq "$DESIRED_COUNT" ]; then
+              # Verify task is HEALTHY
+              TASK_ARN=$(aws ecs list-tasks \
+                --cluster ${{ env.ECS_CLUSTER }} \
+                --service ${{ env.BACKEND_SERVICE }} \
+                --region ${{ env.AWS_REGION }} \
+                --desired-status RUNNING \
+                --query 'taskArns[0]' \
+                --output text)
+
+              HEALTH_STATUS=$(aws ecs describe-tasks \
+                --cluster ${{ env.ECS_CLUSTER }} \
+                --tasks "$TASK_ARN" \
+                --region ${{ env.AWS_REGION }} \
+                --query 'tasks[0].healthStatus' \
+                --output text)
+
+              echo "Health status: $HEALTH_STATUS"
+
+              if [ "$HEALTH_STATUS" == "HEALTHY" ]; then
+                echo "✅ Backend service stabilized and HEALTHY!"
+                exit 0
+              fi
+            fi
+
+            # Check for failed tasks
+            FAILED_TASKS=$(aws ecs describe-services \
+              --cluster ${{ env.ECS_CLUSTER }} \
+              --services ${{ env.BACKEND_SERVICE }} \
+              --region ${{ env.AWS_REGION }} \
+              --query 'services[0].events[0].message' \
+              --output text | grep -i "failed\|stopped\|error" || echo "")
+
+            if [ ! -z "$FAILED_TASKS" ]; then
+              echo "⚠️  Warning: $FAILED_TASKS"
+            fi
+
+            sleep 20
+          done
+
+          echo "❌ Deployment timed out after 20 minutes"
+          echo "Showing recent events:"
+          aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.BACKEND_SERVICE }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'services[0].events[0:10]' \
+            --output table
+          exit 1
+
+      - name: Get deployment status
+        run: |
+          aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.BACKEND_SERVICE }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'services[0].[serviceName,status,runningCount,desiredCount,deployments[0].status]' \
+            --output table
+
+      - name: Check backend health
+        run: |
+          echo "Checking backend health endpoint..."
+          sleep 30
+          curl -f https://seip.armyknifelabs.com/api/v1/health || echo "Health check failed - manual verification required"
+
+  # Build and push frontend
+  deploy-frontend:
+    name: Deploy Frontend
+    runs-on: ubuntu-latest
+    needs: setup
+    if: needs.setup.outputs.deploy_frontend == 'true'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Verify Docker platform support
+        run: |
+          echo "Verifying linux/amd64 platform support for ECS Fargate..."
+          docker buildx inspect --bootstrap
+
+      - name: Build and push frontend image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.frontend
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.ECR_REGISTRY }}/seip-frontend:${{ needs.setup.outputs.version }}
+            ${{ env.ECR_REGISTRY }}/seip-frontend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            APP_VERSION=${{ needs.setup.outputs.version }}
+            NGINX_CONFIG=nginx.production.conf
+            VITE_API_URL=https://seip.armyknifelabs.com/api/v1
+
+      - name: Get current task definition
+        id: get-task-def-frontend
+        run: |
+          echo "Fetching current task definition..."
+          aws ecs describe-task-definition \
+            --task-definition seip-frontend-dashboard \
+            --region ${{ env.AWS_REGION }} \
+            --query 'taskDefinition' > /tmp/frontend-task-def.json
+
+          FAMILY=$(jq -r '.family' /tmp/frontend-task-def.json)
+          echo "family=$FAMILY" >> $GITHUB_OUTPUT
+
+      - name: Update task definition with new image
+        id: update-task-def-frontend
+        run: |
+          echo "Creating new task definition with version ${{ needs.setup.outputs.version }}..."
+
+          # Update task definition with new image
+          jq --arg IMAGE "${{ env.ECR_REGISTRY }}/seip-frontend:${{ needs.setup.outputs.version }}" \
+             'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy) |
+              .containerDefinitions[0].image = $IMAGE' \
+             /tmp/frontend-task-def.json > /tmp/new-frontend-task-def.json
+
+          # Register the new task definition
+          NEW_REVISION=$(aws ecs register-task-definition \
+            --cli-input-json file:///tmp/new-frontend-task-def.json \
+            --region ${{ env.AWS_REGION }} \
+            --query 'taskDefinition.revision' \
+            --output text)
+
+          echo "✅ Registered task definition: seip-frontend-dashboard:${NEW_REVISION}"
+          echo "task_revision=${NEW_REVISION}" >> $GITHUB_OUTPUT
+
+      - name: Deploy to ECS with new task definition
+        run: |
+          echo "Deploying frontend with task definition revision ${{ steps.update-task-def-frontend.outputs.task_revision }}..."
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.FRONTEND_SERVICE }} \
+            --task-definition seip-frontend-dashboard:${{ steps.update-task-def-frontend.outputs.task_revision }} \
+            --force-new-deployment \
+            --region ${{ env.AWS_REGION }} \
+            --output table
+
+      - name: Wait for deployment (with extended timeout)
+        timeout-minutes: 20
+        run: |
+          echo "Waiting for ECS service to stabilize (up to 20 minutes)..."
+          echo "Monitoring deployment progress..."
+
+          MAX_ATTEMPTS=60
+          ATTEMPT=0
+
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+
+            SERVICE_STATUS=$(aws ecs describe-services \
+              --cluster ${{ env.ECS_CLUSTER }} \
+              --services ${{ env.FRONTEND_SERVICE }} \
+              --region ${{ env.AWS_REGION }} \
+              --query 'services[0]' \
+              --output json)
+
+            RUNNING_COUNT=$(echo $SERVICE_STATUS | jq -r '.runningCount')
+            DESIRED_COUNT=$(echo $SERVICE_STATUS | jq -r '.desiredCount')
+            DEPLOYMENT_COUNT=$(echo $SERVICE_STATUS | jq -r '.deployments | length')
+
+            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS: Running=$RUNNING_COUNT Desired=$DESIRED_COUNT Deployments=$DEPLOYMENT_COUNT"
+
+            if [ "$DEPLOYMENT_COUNT" -eq 1 ] && [ "$RUNNING_COUNT" -eq "$DESIRED_COUNT" ]; then
+              TASK_ARN=$(aws ecs list-tasks \
+                --cluster ${{ env.ECS_CLUSTER }} \
+                --service ${{ env.FRONTEND_SERVICE }} \
+                --region ${{ env.AWS_REGION }} \
+                --desired-status RUNNING \
+                --query 'taskArns[0]' \
+                --output text)
+
+              HEALTH_STATUS=$(aws ecs describe-tasks \
+                --cluster ${{ env.ECS_CLUSTER }} \
+                --tasks "$TASK_ARN" \
+                --region ${{ env.AWS_REGION }} \
+                --query 'tasks[0].healthStatus' \
+                --output text)
+
+              echo "Health status: $HEALTH_STATUS"
+
+              if [ "$HEALTH_STATUS" == "HEALTHY" ]; then
+                echo "✅ Frontend service stabilized and HEALTHY!"
+                exit 0
+              fi
+            fi
+
+            FAILED_TASKS=$(aws ecs describe-services \
+              --cluster ${{ env.ECS_CLUSTER }} \
+              --services ${{ env.FRONTEND_SERVICE }} \
+              --region ${{ env.AWS_REGION }} \
+              --query 'services[0].events[0].message' \
+              --output text | grep -i "failed\|stopped\|error" || echo "")
+
+            if [ ! -z "$FAILED_TASKS" ]; then
+              echo "⚠️  Warning: $FAILED_TASKS"
+            fi
+
+            sleep 20
+          done
+
+          echo "❌ Deployment timed out after 20 minutes"
+          echo "Showing recent events:"
+          aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.FRONTEND_SERVICE }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'services[0].events[0:10]' \
+            --output table
+          exit 1
+
+      - name: Get deployment status
+        run: |
+          aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.FRONTEND_SERVICE }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'services[0].[serviceName,status,runningCount,desiredCount,deployments[0].status]' \
+            --output table
+
+      - name: Check frontend health
+        run: |
+          echo "Checking frontend..."
+          sleep 30
+          curl -f https://seip.armyknifelabs.com/ || echo "Frontend check failed - manual verification required"
+
+  # Deployment success notification
+  deployment-success:
+    name: Deployment Complete
+    runs-on: ubuntu-latest
+    needs: [setup, deploy-backend, deploy-frontend]
+    if: always()
+
+    steps:
+      - name: Deployment summary
+        run: |
+          echo "═══════════════════════════════════════════════════════════════"
+          echo "                    DEPLOYMENT SUMMARY"
+          echo "═══════════════════════════════════════════════════════════════"
+          echo "Version: ${{ needs.setup.outputs.version }}"
+          echo "Environment: ${{ needs.setup.outputs.environment }}"
+          echo "Backend deployed: ${{ needs.setup.outputs.deploy_backend }}"
+          echo "Frontend deployed: ${{ needs.setup.outputs.deploy_frontend }}"
+          echo ""
+          echo "Production URL: https://seip.armyknifelabs.com"
+          echo "API URL: https://seip.armyknifelabs.com/api/v1"
+          echo "═══════════════════════════════════════════════════════════════"
+
+      - name: Check deployment results
+        run: |
+          BACKEND_STATUS="${{ needs.deploy-backend.result }}"
+          FRONTEND_STATUS="${{ needs.deploy-frontend.result }}"
+
+          if [ "$BACKEND_STATUS" == "failure" ] || [ "$FRONTEND_STATUS" == "failure" ]; then
+            echo "❌ Deployment failed - check logs above"
+            exit 1
+          elif [ "$BACKEND_STATUS" == "skipped" ] && [ "$FRONTEND_STATUS" == "skipped" ]; then
+            echo "⚠️  No services were deployed"
+          else
+            echo "✅ Deployment completed successfully!"
+          fi

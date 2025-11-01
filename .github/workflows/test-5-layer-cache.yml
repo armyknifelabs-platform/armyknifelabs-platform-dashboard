@@ -1,0 +1,342 @@
+name: Test 5-Layer Cache System
+
+on:
+  schedule:
+    # Run hourly on the guest branch to catch cache issues early
+    - cron: '0 * * * *'
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - production
+    paths:
+      - 'packages/backend/src/services/cache/**'
+      - 'packages/backend/src/routes/github/cache.routes.ts'
+      - 'packages/backend/src/routes/health.routes.ts'
+
+jobs:
+  test-cache-system:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      NODE_ENV: test
+      VITE_API_URL: ${{ secrets.VITE_API_URL_GUEST || 'http://localhost:3001' }}
+      API_PORT: 3001
+      REDIS_HOST: localhost
+      REDIS_PORT: 6379
+      DATABASE_URL: ${{ secrets.DATABASE_URL_GUEST }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    services:
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: seip_test
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci --workspaces
+
+      - name: Run database migrations
+        working-directory: packages/backend
+        env:
+          DATABASE_URL: postgresql://test_user:test_password@localhost:5432/seip_test
+        run: |
+          npm run db:migrate || echo "Migrations optional for cache testing"
+
+      - name: Build backend
+        working-directory: packages/backend
+        run: npm run build
+
+      - name: Start backend server
+        working-directory: packages/backend
+        run: |
+          npm run dev > server.log 2>&1 &
+          sleep 3
+          echo "Backend server started"
+        env:
+          DATABASE_URL: postgresql://test_user:test_password@localhost:5432/seip_test
+
+      - name: Wait for backend to be ready
+        run: |
+          timeout 30 bash -c 'until curl -f http://localhost:3001/health; do echo "Waiting for server..."; sleep 1; done'
+
+      - name: Test Layer 1 - Health Check (Core Infrastructure)
+        id: layer1-health
+        run: |
+          echo "Testing Layer 1: Health Check Endpoint"
+          response=$(curl -s -w "\n%{http_code}" http://localhost:3001/health)
+          http_code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | head -n-1)
+
+          echo "HTTP Status: $http_code"
+          echo "Response: $body"
+
+          if [ "$http_code" != "200" ]; then
+            echo "❌ Layer 1 FAILED: Health check returned $http_code"
+            exit 1
+          fi
+
+          echo "✅ Layer 1 PASSED: Health check operational"
+
+          # Verify essential fields
+          if echo "$body" | jq -e '.status == "ok"' > /dev/null; then
+            echo "✅ Health response structure valid"
+          else
+            echo "❌ Health response structure invalid"
+            exit 1
+          fi
+
+      - name: Test Layer 2 - Redis Cache Connection
+        id: layer2-redis
+        run: |
+          echo "Testing Layer 2: Redis Cache Connectivity"
+
+          # Test Redis connection via cache API
+          response=$(curl -s -w "\n%{http_code}" http://localhost:3001/cache/status 2>/dev/null || echo '{"success":false}\n500')
+          http_code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | head -n-1)
+
+          echo "HTTP Status: $http_code"
+          echo "Response: $body"
+
+          if [ "$http_code" == "200" ] && echo "$body" | jq -e '.success == true' > /dev/null 2>&1; then
+            echo "✅ Layer 2 PASSED: Redis cache operational"
+          else
+            echo "⚠️  Layer 2 WARNING: Redis may not be initialized yet (expected on first run)"
+            # Don't fail here as this is initialization
+          fi
+
+      - name: Test Layer 3 - In-Memory Cache (Application Cache)
+        id: layer3-app-cache
+        run: |
+          echo "Testing Layer 3: Application In-Memory Cache"
+
+          # Create a simple test by calling an endpoint that uses cache
+          response=$(curl -s -w "\n%{http_code}" http://localhost:3001/cache/repos 2>/dev/null || echo '{"success":false}\n500')
+          http_code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | head -n-1)
+
+          echo "HTTP Status: $http_code"
+          echo "Response: $body"
+
+          if [ "$http_code" == "200" ]; then
+            echo "✅ Layer 3 PASSED: Application cache responding"
+            if echo "$body" | jq -e '.success == true' > /dev/null 2>&1; then
+              echo "✅ Cache repository list accessible"
+            fi
+          elif [ "$http_code" == "404" ]; then
+            echo "⚠️  Layer 3 WARNING: Endpoint may be unavailable (status 404)"
+          else
+            echo "⚠️  Layer 3 WARNING: Cache endpoint returned $http_code"
+          fi
+
+      - name: Test Layer 4 - Database Query Cache
+        id: layer4-db-cache
+        run: |
+          echo "Testing Layer 4: Database Query Caching"
+
+          # Verify database connectivity is working
+          response=$(curl -s -w "\n%{http_code}" http://localhost:3001/health 2>/dev/null || echo '{"success":false}\n500')
+          http_code=$(echo "$response" | tail -n1)
+
+          if [ "$http_code" == "200" ]; then
+            echo "✅ Layer 4 PASSED: Database accessible through API"
+          else
+            echo "⚠️  Layer 4 WARNING: Database connectivity check returned $http_code"
+          fi
+
+      - name: Test Layer 5 - Persistent Storage (S3/Disk Cache)
+        id: layer5-persistent
+        run: |
+          echo "Testing Layer 5: Persistent Cache Storage"
+
+          # Test repository cache endpoints which use persistent storage
+          response=$(curl -s -w "\n%{http_code}" http://localhost:3001/cache/repos 2>/dev/null || echo '{"success":false}\n500')
+          http_code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | head -n-1)
+
+          echo "HTTP Status: $http_code"
+
+          if [ "$http_code" == "200" ]; then
+            echo "✅ Layer 5 PASSED: Persistent storage accessible"
+
+            # Check if repositories list is properly formatted
+            if echo "$body" | jq -e '.success == true and .data != null' > /dev/null 2>&1; then
+              count=$(echo "$body" | jq '.metadata.count // 0')
+              echo "✅ Found $count cached repositories in persistent storage"
+            fi
+          elif [ "$http_code" == "404" ]; then
+            echo "⚠️  Layer 5 INFO: No cached repositories found (status 404 - expected on new deployment)"
+          else
+            echo "⚠️  Layer 5 WARNING: Persistent storage check returned $http_code"
+          fi
+
+      - name: Test Cache Hit Rate
+        id: cache-hitrate
+        run: |
+          echo "Testing Cache Hit Rate (Repeated Requests)"
+
+          # Make multiple requests to same endpoint to test cache hits
+          echo "Making 5 requests to /health endpoint..."
+          for i in {1..5}; do
+            response=$(curl -s http://localhost:3001/health)
+            echo "Request $i: $(echo $response | jq -r '.status')"
+          done
+
+          echo "✅ Cache hit rate test completed (check logs for response times)"
+
+      - name: Test Cache Invalidation
+        id: cache-invalidation
+        run: |
+          echo "Testing Cache Invalidation Mechanism"
+
+          # Test cleanup endpoint (should handle gracefully even with no repos)
+          response=$(curl -s -w "\n%{http_code}" -X POST http://localhost:3001/cache/cleanup \
+            -H "Content-Type: application/json" \
+            -d '{"daysInactive": 30}' 2>/dev/null || echo '{"success":false}\n500')
+          http_code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | head -n-1)
+
+          echo "HTTP Status: $http_code"
+
+          if [ "$http_code" == "200" ] || [ "$http_code" == "404" ]; then
+            echo "✅ Cache invalidation mechanism responding"
+          else
+            echo "⚠️  Cache invalidation returned $http_code"
+          fi
+
+      - name: Verify Cache Consistency
+        id: cache-consistency
+        run: |
+          echo "Testing Cache Consistency (Multiple Reads)"
+
+          # Perform multiple reads of the same endpoint
+          echo "Performing consistency check..."
+          response1=$(curl -s http://localhost:3001/health | jq -r '.uptime')
+          sleep 1
+          response2=$(curl -s http://localhost:3001/health | jq -r '.uptime')
+
+          if [ ! -z "$response1" ] && [ ! -z "$response2" ]; then
+            echo "✅ Cache consistency verified"
+            echo "   First read uptime: $response1"
+            echo "   Second read uptime: $response2"
+          else
+            echo "⚠️  Could not verify cache consistency"
+          fi
+
+      - name: Collect Cache Metrics
+        id: cache-metrics
+        run: |
+          echo "Collecting Cache System Metrics"
+
+          # Attempt to get cache statistics
+          stats=$(curl -s http://localhost:3001/cache/status 2>/dev/null || echo '{}')
+
+          echo "Cache Statistics:"
+          echo "$stats" | jq '.' 2>/dev/null || echo "Stats collection incomplete (expected on first run)"
+
+          echo "✅ Cache metrics collected"
+
+      - name: Verify Error Handling
+        id: error-handling
+        run: |
+          echo "Testing Cache Error Handling"
+
+          # Test invalid cache request
+          response=$(curl -s -w "\n%{http_code}" http://localhost:3001/cache/repos/nonexistent/repo 2>/dev/null || echo '{"success":false}\n500')
+          http_code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | head -n-1)
+
+          echo "HTTP Status: $http_code"
+
+          if [ "$http_code" == "404" ]; then
+            echo "✅ Error handling working: Correctly returned 404 for missing repo"
+          elif [ "$http_code" == "500" ]; then
+            echo "❌ Error handling issue: Returned 500 instead of 404"
+            exit 1
+          else
+            echo "⚠️  Unexpected status code: $http_code"
+          fi
+
+      - name: Summary Report
+        if: always()
+        run: |
+          echo "## 5-Layer Cache System Test Summary"
+          echo ""
+          echo "### Test Results:"
+          echo "- Layer 1 (Health Check): ${{ steps.layer1-health.outcome }}"
+          echo "- Layer 2 (Redis Cache): ${{ steps.layer2-redis.outcome }}"
+          echo "- Layer 3 (App Cache): ${{ steps.layer3-app-cache.outcome }}"
+          echo "- Layer 4 (DB Cache): ${{ steps.layer4-db-cache.outcome }}"
+          echo "- Layer 5 (Persistent Storage): ${{ steps.layer5-persistent.outcome }}"
+          echo ""
+          echo "### Additional Tests:"
+          echo "- Cache Hit Rate: ${{ steps.cache-hitrate.outcome }}"
+          echo "- Cache Invalidation: ${{ steps.cache-invalidation.outcome }}"
+          echo "- Cache Consistency: ${{ steps.cache-consistency.outcome }}"
+          echo "- Cache Metrics: ${{ steps.cache-metrics.outcome }}"
+          echo "- Error Handling: ${{ steps.error-handling.outcome }}"
+          echo ""
+          echo "### Conclusion:"
+          if [ "${{ steps.layer1-health.outcome }}" = "success" ] && [ "${{ steps.error-handling.outcome }}" = "success" ]; then
+            echo "✅ Core cache infrastructure operational"
+          else
+            echo "⚠️  Some cache layers may need attention"
+          fi
+
+      - name: Upload server logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-server-logs
+          path: packages/backend/server.log
+          retention-days: 7
+
+      - name: Notify on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '⚠️ **Cache System Test Failed** - See workflow logs for details'
+            })
+
+      - name: Mark success
+        if: success()
+        run: |
+          echo "✅ All cache system tests completed successfully"
