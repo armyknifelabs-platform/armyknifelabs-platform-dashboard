@@ -1,0 +1,52 @@
+{
+  "release": "v1.0.0",
+  "createdAt": "2025-11-01T00:00:00Z",
+  "description": "Initial synchronized release of platform components",
+  "components": {
+    "database": {
+      "commit": "",
+      "shortCommit": "",
+      "repository": "armyknifelabs-platform-database",
+      "description": "PostgreSQL schemas with pgvector extension"
+    },
+    "backend": {
+      "commit": "",
+      "shortCommit": "",
+      "repository": "armyknifelabs-platform-backend",
+      "description": "Node.js Fastify backend with RAG system"
+    },
+    "frontend": {
+      "commit": "",
+      "shortCommit": "",
+      "repository": "armyknifelabs-platform-frontend",
+      "description": "React TypeScript frontend with metrics dashboard"
+    }
+  },
+  "features": [
+    "Multi-repository orchestration",
+    "Synchronized versioning across components",
+    "Parallel builds with Docker image caching",
+    "Environment promotion workflow (guest → test → production)",
+    "Automated health checks and validation",
+    "Rollback capabilities"
+  ],
+  "deployment": {
+    "tested": false,
+    "environment": "development",
+    "status": "untested",
+    "lastDeployedAt": null,
+    "deployedBy": null
+  },
+  "compatibility": {
+    "minimumVersions": {
+      "node": "20.x",
+      "postgresql": "15.x",
+      "redis": "7.x"
+    }
+  },
+  "metadata": {
+    "buildNumber": null,
+    "ciRunId": null,
+    "ciRunUrl": null
+  }
+}
